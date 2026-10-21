@@ -404,9 +404,8 @@ done
 }
 
 #[test]
-fn review2_shell_boundaries() {
+fn shell_restored_proxy_and_ca_keep_nested_claude_pooled() {
     let fixture = AgentFixture::new();
-    let mut failures = Vec::new();
     script(
         &fixture.home.path().join("real-claude"),
         r#"
@@ -432,9 +431,31 @@ exec "$CLAUDE_CODE_SHELL_PREFIX" 'INNER=yes claude'
         )
         .output()
         .unwrap();
-    if !output.status.success() {
-        failures.push("M2 restored proxy/CA bypass nested pooling");
-    }
+    assert!(
+        output.status.success(),
+        "shell restored proxy and ca keep nested claude pooled: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn shell_restored_ca_keeps_nested_claude_trusted() {
+    let fixture = AgentFixture::new();
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"
+if [ "${INNER:-}" = yes ]; then
+    test "$HTTPS_PROXY" = "$EXPECTED_MODEL"
+    test "$NODE_EXTRA_CA_CERTS" = "$HOME/.config/tcr-ca.pem"
+    printf 'nested-pooled\n'; exit
+fi
+exec "$CLAUDE_CODE_SHELL_PREFIX" 'INNER=yes claude'
+"#,
+    );
+    let fixture_config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture.home.path().join("config.json")).unwrap())
+            .unwrap();
+    let port = fixture_config["proxy"]["port"].as_u64().unwrap();
     let output = fixture
         .command()
         .env("NODE_EXTRA_CA_CERTS", "/caller/ca.pem")
@@ -444,9 +465,16 @@ exec "$CLAUDE_CODE_SHELL_PREFIX" 'INNER=yes claude'
         )
         .output()
         .unwrap();
-    if !output.status.success() {
-        failures.push("M2 restored CA breaks nested trust");
-    }
+    assert!(
+        output.status.success(),
+        "shell restored ca keeps nested claude trusted: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn shell_env_file_values_survive_cleanup() {
+    let fixture = AgentFixture::new();
     std::fs::write(
         fixture.home.path().join("caller.env"),
         "export HTTPS_PROXY=http://env-file.example:8124\nexport NODE_EXTRA_CA_CERTS=/env/ca.pem\n",
@@ -461,9 +489,16 @@ exec "$CLAUDE_CODE_SHELL_PREFIX" 'INNER=yes claude'
         .env("CLAUDE_ENV_FILE", fixture.home.path().join("caller.env"))
         .output()
         .unwrap();
-    if !output.status.success() {
-        failures.push("M3 env-file values lost after sourcing");
-    }
+    assert!(
+        output.status.success(),
+        "shell env file values survive cleanup: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn shell_claude_prefix_flags_do_not_block_codex() {
+    let fixture = AgentFixture::new();
     script(
         &fixture.home.path().join("real-codex"),
         "printf 'codex-ok\\n'",
@@ -474,16 +509,35 @@ exec "$CLAUDE_CODE_SHELL_PREFIX" 'INNER=yes claude'
         .env("CLAUDE_CODE_SHELL_PREFIX", "/audit --flag")
         .output()
         .unwrap();
-    if !output.status.success() {
-        failures.push("S2 codex refused Claude prefix flags");
-    }
+    assert!(
+        output.status.success(),
+        "shell claude prefix flags do not block codex: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn shell_codex_launch_prints_one_routing_notice() {
+    let fixture = AgentFixture::new();
+    script(
+        &fixture.home.path().join("real-codex"),
+        "printf 'codex-ok\\n'",
+    );
     let output = fixture.command().arg("--codex").output().unwrap();
     let notices = String::from_utf8_lossy(&output.stderr)
         .matches("shell tools use the caller's")
         .count();
-    if notices != 1 {
-        failures.push("N3 duplicate shell routing notices");
-    }
+    assert_eq!(
+        notices,
+        1,
+        "shell codex launch prints one routing notice: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn shell_prefix_accepts_an_executable_with_space_dash() {
+    let fixture = AgentFixture::new();
     let wrap = fixture.home.path().join("audit -wrapper");
     script(&wrap, "exec /bin/bash -c \"$1\"");
     script(
@@ -495,9 +549,20 @@ exec "$CLAUDE_CODE_SHELL_PREFIX" 'INNER=yes claude'
         .env("CLAUDE_CODE_SHELL_PREFIX", &wrap)
         .output()
         .unwrap();
-    if !output.status.success() {
-        failures.push("S2 executable space-dash path refused");
-    }
+    assert!(
+        output.status.success(),
+        "shell prefix accepts an executable with space dash: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn shell_removed_helper_prefix_is_discarded() {
+    let fixture = AgentFixture::new();
+    script(
+        &fixture.home.path().join("real-claude"),
+        r#"exec "$CLAUDE_CODE_SHELL_PREFIX" 'printf wrapper-ok'"#,
+    );
     let stale = fixture
         .home
         .path()
@@ -507,9 +572,20 @@ exec "$CLAUDE_CODE_SHELL_PREFIX" 'INNER=yes claude'
         .env("CLAUDE_CODE_SHELL_PREFIX", stale)
         .output()
         .unwrap();
-    if !output.status.success() {
-        failures.push("S3 stale helper executed as caller wrapper");
-    }
+    assert!(
+        output.status.success(),
+        "shell removed helper prefix is discarded: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn shell_alias_nested_codex_uses_canonical_tcr() {
+    let fixture = AgentFixture::new();
+    script(
+        &fixture.home.path().join("real-codex"),
+        "printf 'codex-ok\\n'",
+    );
     let alias = fixture.home.path().join("tcr-run");
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_tcr"), &alias).unwrap();
     script(
@@ -529,10 +605,11 @@ exec "$CLAUDE_CODE_SHELL_PREFIX" 'INNER=yes claude'
         }
     }
     let output = aliased.output().unwrap();
-    if !output.status.success() {
-        failures.push("M5 tcr-run nested codex argv is doubled");
-    }
-    assert!(failures.is_empty(), "shell boundary defects: {failures:?}");
+    assert!(
+        output.status.success(),
+        "shell alias nested codex uses canonical tcr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
