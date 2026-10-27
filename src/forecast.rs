@@ -1260,6 +1260,36 @@ mod tests {
     }
 
     #[test]
+    fn forecast_completed_records_at_the_upper_reading_revise_one_interval() {
+        let mut c = Calibration::default();
+        c.observe(buckets(10.0, 20_000), 1000, true);
+        c.observe(buckets(11.0, 20_000), 2000, true);
+        assert!(c.windows[0].samples.is_empty());
+        c.record(&record(2000, "fable", 100, 0));
+        assert_eq!(
+            c.windows[0].samples.len(),
+            1,
+            "a completed ledger record at the upper reading belongs to that interval"
+        );
+        assert_eq!(c.windows[0].samples[0].0["fable"], [100, 0]);
+        c.record(&record(2000, "fable", 0, 25));
+        assert_eq!(
+            c.windows[0].samples.len(),
+            1,
+            "two completions at the upper reading revise rather than duplicate the sample"
+        );
+        assert_eq!(c.windows[0].samples[0].0["fable"], [100, 25]);
+        c.observe(buckets(12.0, 20_000), 3000, true);
+        c.record(&record(3000, "fable", 200, 0));
+        assert_eq!(c.windows[0].samples.len(), 2);
+        assert_eq!(
+            c.windows[0].samples[1].0["fable"],
+            [200, 0],
+            "records at the lower reading cannot leak into the next interval"
+        );
+    }
+
+    #[test]
     fn forecast_profile_is_monday_first_normalized_shrunk_and_banded() {
         let start = OffsetDateTime::parse(
             "2026-09-28T00:00:00Z",
