@@ -1232,6 +1232,34 @@ mod tests {
     }
 
     #[test]
+    fn forecast_completed_intervals_use_only_records_inside_the_reading_times() {
+        let mut c = Calibration::default();
+        c.observe(buckets(10.0, 20_000), 1000, true);
+        c.record(&record(1000, "fable", 999, 0));
+        c.record(&record(4000, "fable", 777, 0));
+        c.observe(buckets(11.0, 20_000), 2000, true);
+        assert!(
+            c.windows[0].samples.is_empty(),
+            "no interval may use absent, lower-bound or future ledger tokens"
+        );
+        c.record(&record(2500, "fable", 100, 0));
+        c.observe(buckets(12.0, 20_000), 3000, true);
+        assert_eq!(
+            c.windows[0].samples.len(),
+            1,
+            "a completed record can train while another request is in flight"
+        );
+        assert_eq!(c.windows[0].samples[0].0["fable"], [100, 0]);
+        c.observe(buckets(13.0, 20_000), 5000, true);
+        assert_eq!(c.windows[0].samples.len(), 2);
+        assert_eq!(
+            c.windows[0].samples[1].0["fable"],
+            [777, 0],
+            "a future record belongs only to the interval containing its time"
+        );
+    }
+
+    #[test]
     fn forecast_profile_is_monday_first_normalized_shrunk_and_banded() {
         let start = OffsetDateTime::parse(
             "2026-09-28T00:00:00Z",

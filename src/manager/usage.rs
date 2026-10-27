@@ -863,3 +863,88 @@ mod routing_observation_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod completed_header_interval_tests {
+    use super::*;
+    use crate::config::{Account, Config};
+    use crate::usage::UsageRecord;
+
+    #[test]
+    fn forecast_two_in_flight_requests_use_only_completed_ledger_usage() {
+        let mut config = Config::fixture(vec![Account::fixture("alice@example.com")]);
+        config.upstream = "http://127.0.0.1:1".into();
+        let manager = Manager::with_live_refresher(config, None);
+        let start = OffsetDateTime::from_unix_timestamp(1_767_225_600).unwrap();
+        let tick = |percent: u64| {
+            let bucket = Some(crate::probe::UsageBucket {
+                utilization: Some(percent as f64 / 100.0),
+                reset_at_ms: Some((start.unix_timestamp() + 18_000) * 1000),
+            });
+            Usage {
+                five_hour: bucket,
+                seven_day: bucket,
+                seven_day_oi: bucket,
+                ..Default::default()
+            }
+        };
+        // Both guards span each reading. Only the completing request records
+        // usage; the stalled request supplies neither tokens nor an estimate.
+        let stalled = manager.enter_in_flight_at(0, start);
+        let mut completing = manager.enter_in_flight_at(0, start);
+        manager.apply_usage_at(0, &tick(10), start);
+        manager.apply_usage_at(0, &tick(11), start + time::Duration::seconds(1));
+        assert!(
+            manager.forecast.lock().unwrap()[0]
+                .scale(0, "fable")
+                .is_none()
+        );
+        for step in 1..=24 {
+            let at = start + time::Duration::seconds(2 * step);
+            let (input, output) = if step % 2 == 0 { (100, 0) } else { (0, 25) };
+            manager.record_usage(
+                0,
+                UsageRecord::from_quota_input(
+                    odt_to_ms(at) - 1,
+                    Some("claude-fable-5".into()),
+                    None,
+                    input,
+                    0,
+                    0,
+                    0,
+                    output,
+                ),
+            );
+            manager.apply_usage_at(0, &tick(11 + step as u64), at);
+            drop(completing);
+            completing = manager.enter_in_flight_at(0, at);
+        }
+        {
+            let fits = manager.forecast.lock().unwrap();
+            for window in 0..3 {
+                let scale = fits[0]
+                    .scale(window, "fable")
+                    .expect("completed ledger intervals must train with two requests in flight");
+                assert!((scale.tokens_per_percent - 100.0).abs() < 2.0);
+                assert!(
+                    (scale.output_weight - 4.0).abs() < 0.1,
+                    "the stalled request contributes no invented token vector"
+                );
+            }
+        }
+        // A further tick with no completed usage cannot build a sample from
+        // either outstanding guard, even after a valid full-rank fit exists.
+        manager.apply_usage_at(0, &tick(36), start + time::Duration::seconds(50));
+        assert!(
+            manager.forecast.lock().unwrap()[0]
+                .scale(0, "fable")
+                .is_none(),
+            "unexplained rises cannot use unrecorded in-flight tokens"
+        );
+        let snapshot = manager.snapshot(start + time::Duration::seconds(50));
+        assert_eq!(snapshot.accounts[0].input_tokens, 1200);
+        assert_eq!(snapshot.accounts[0].output_tokens, 300);
+        drop(completing);
+        drop(stalled);
+    }
+}
