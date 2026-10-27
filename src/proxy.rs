@@ -26368,6 +26368,8 @@ mod forecast_routing_tests {
             ),
         );
         for _ in 0..=24 {
+            // Keep consecutive readings and completions on distinct milliseconds.
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
             post(
                 Arc::clone(&manager),
                 "/v1/messages",
