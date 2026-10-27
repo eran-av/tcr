@@ -26330,6 +26330,82 @@ mod tests {
 /// status route.
 #[cfg(test)]
 mod forecast_routing_tests {
+    // Preserve the review fixture body verbatim apart from rustfmt.
+    #[expect(
+        unused_qualifications,
+        clippy::cast_lossless,
+        reason = "the goal freezes the supplied review fixture body"
+    )]
+    #[tokio::test]
+    async fn real_response_headers_train_calibration() {
+        let now = OffsetDateTime::now_utc();
+        let reset = now.unix_timestamp() + 18_000;
+        let replies = (0..=24).map(|step| {
+            let (input, output) = if step % 2 == 0 { (100, 0) } else { (0, 25) };
+            let body = serde_json::json!({"model":"claude-fable-5", "content":[],
+                "usage":{"input_tokens":input,"output_tokens":output}}).to_string();
+            let mut headers = String::new();
+            for window in ["5h", "7d", "7d_oi"] {
+                headers.push_str(&format!("anthropic-ratelimit-unified-{window}-utilization: {}\r\nanthropic-ratelimit-unified-{window}-reset: {reset}\r\n", (10+step) as f64 / 100.0));
+            }
+            Some(stub::reply("200 OK", "application/json", &body).replacen("content-type:", &format!("{headers}content-type:"), 1))
+        }).collect();
+        let (upstream, calls) = stub::scripted(replies);
+        let mut config = Config::fixture(vec![Account::fixture("alice@example.com")]);
+        config.upstream = format!("http://{upstream}");
+        let manager = keyed(config);
+        manager.record_usage(
+            0,
+            crate::usage::UsageRecord::from_quota_input(
+                (now.unix_timestamp().div_euclid(3600) - 2) * 3_600_000,
+                Some("claude-fable-5".into()),
+                None,
+                100,
+                0,
+                0,
+                0,
+                25,
+            ),
+        );
+        for _ in 0..=24 {
+            post(
+                Arc::clone(&manager),
+                "/v1/messages",
+                r#"{"model":"claude-fable-5","messages":[],"max_tokens":32}"#,
+            )
+            .await;
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            25,
+            "all training responses reached the upstream"
+        );
+        let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(
+            snapshot.accounts[0].input_tokens, 1400,
+            "real input usage was recorded"
+        );
+        assert_eq!(
+            snapshot.accounts[0].output_tokens, 325,
+            "real output usage was recorded"
+        );
+        let value = document(manager).await;
+        assert!(
+            value["forecast"].is_object(),
+            "fully observed demand must produce a non-null forecast"
+        );
+        assert!(
+            value["forecast"]["providers"][0]["historyHours"]
+                .as_f64()
+                .is_some_and(|h| h >= 2.0),
+            "two complete demand hours are observed"
+        );
+        assert_eq!(
+            value["forecast"]["providers"][0]["calibrated"], true,
+            "real response-header ticks must train calibration without probes"
+        );
+    }
+
     use super::*;
     use crate::config::{Account, Config, ProxyConfig};
 
