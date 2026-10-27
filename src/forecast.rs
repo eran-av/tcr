@@ -1,6 +1,6 @@
 //! Demand estimates and cold, runtime-only quota calibration. Nothing here selects an
 //! account or fetches a reading. The ledger owns demand, and the Manager supplies exact
-//! completed usage vectors and quiescent readings while holding its account lock.
+//! completed usage vectors and first-hand readings while holding its account lock.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::Serialize;
@@ -159,7 +159,7 @@ struct Anchor {
     tokens: Tokens,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct WindowFit {
     anchor: Option<Anchor>,
     samples: VecDeque<(Tokens, f64)>,
@@ -223,8 +223,10 @@ impl WindowFit {
             }
         }
         if delta.is_empty() {
-            // A rising percent without exact classified tokens is unexplained.
-            self.invalidate();
+            // Reject the unexplained interval and its readiness, as the ledger
+            // fit does. Earlier exact pairs remain evidence; no empty row is
+            // added, and only a later exact interval can refit them.
+            self.scales.clear();
         } else {
             self.samples
                 .push_back((delta, current.percent - prior.percent));
@@ -237,10 +239,24 @@ impl WindowFit {
     }
 }
 
+/// Re-evaluate the latest interval when a completed body lands at its upper
+/// millisecond. Retaining the pre-reading state replaces its sample atomically;
+/// multiple completions at that instant can never count as multiple readings.
+#[derive(Debug)]
+struct Reading {
+    at: i64,
+    buckets: [Option<crate::probe::UsageBucket>; 3],
+    before: [WindowFit; 3],
+    unfinished: bool,
+    completed: bool,
+}
+
 /// One stable account slot. No identity, anchors or fit is persisted at restart.
 #[derive(Debug, Default)]
 pub(crate) struct Calibration {
     tokens: Tokens,
+    pending: BTreeMap<i64, Tokens>,
+    reading: Option<Reading>,
     windows: [WindowFit; 3],
     last_reading: Option<i64>,
 }
@@ -252,14 +268,36 @@ impl Calibration {
             self.invalidate();
             return;
         };
-        if self.last_reading.is_some_and(|at| record.ts_ms <= at)
-            || add(self.tokens.entry(family).or_default(), value).is_none()
+        if self.last_reading.is_some_and(|at| record.ts_ms < at) {
+            self.invalidate();
+            return;
+        }
+        // Ledger time owns (first, second]. A body completed in the same
+        // millisecond as the latest headers belongs to that interval's upper
+        // boundary, even when its record arrives after the header callback.
+        if self.last_reading == Some(record.ts_ms) {
+            if add(self.tokens.entry(family).or_default(), value).is_none() {
+                self.invalidate();
+                return;
+            }
+            if let Some(reading) = &mut self.reading {
+                reading.completed = true;
+            }
+            self.fold_reading();
+            return;
+        }
+        let tokens = self.pending.entry(record.ts_ms).or_default();
+        if add(tokens.entry(family).or_default(), value).is_none()
+            || self.pending.len() > MAX_SAMPLES
         {
+            // Bounded storage cannot silently drop part of a fitted interval.
+            self.pending.clear();
             self.invalidate();
         }
     }
 
     fn invalidate(&mut self) {
+        self.reading = None;
         for window in &mut self.windows {
             window.invalidate();
         }
@@ -271,29 +309,57 @@ impl Calibration {
         now: i64,
         unfinished: bool,
     ) {
-        if unfinished {
-            // This reading cannot bracket completed vectors. Keep the valid
-            // quiescent anchor and samples, so intervening response headers do
-            // not erase evidence between two valid probe readings.
-            for window in &mut self.windows {
-                window.scales.clear();
-            }
-            return;
-        }
         if self.last_reading.is_some_and(|prior| now < prior) {
             self.invalidate();
             self.last_reading = Some(now);
             return;
         }
+        let mut completed = false;
+        while let Some(entry) = self.pending.first_entry() {
+            if *entry.key() > now {
+                break;
+            }
+            let (_, tokens) = entry.remove_entry();
+            for (family, value) in tokens {
+                if add(self.tokens.entry(family).or_default(), value).is_none() {
+                    self.invalidate();
+                    return;
+                }
+            }
+            completed = true;
+        }
         self.last_reading = Some(now);
-        for (idx, (window, bucket)) in self.windows.iter_mut().zip(buckets).enumerate() {
+        self.reading = Some(Reading {
+            at: now,
+            buckets,
+            before: self.windows.clone(),
+            unfinished,
+            completed,
+        });
+        self.fold_reading();
+    }
+
+    fn fold_reading(&mut self) {
+        let Some(reading) = &self.reading else {
+            return;
+        };
+        self.windows = reading.before.clone();
+        // A guard is not a token vector. With no completion, overlap cannot
+        // reaffirm readiness. Every reading still reaches the fit's ordinary
+        // same-window, percent and exact-vector validation.
+        if reading.unfinished && !reading.completed {
+            for window in &mut self.windows {
+                window.scales.clear();
+            }
+        }
+        for (idx, (window, bucket)) in self.windows.iter_mut().zip(reading.buckets).enumerate() {
             let tokens = self
                 .tokens
                 .iter()
                 .filter(|(family, _)| idx != 2 || *family == "fable")
                 .map(|(family, tokens)| (family.clone(), *tokens))
                 .collect();
-            window.observe(bucket, now, tokens);
+            window.observe(bucket, reading.at, tokens);
         }
     }
 
