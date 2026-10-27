@@ -1290,6 +1290,31 @@ mod tests {
     }
 
     #[test]
+    fn forecast_unexplained_interval_is_rejected_without_erasing_valid_samples() {
+        let mut c = train(&["fable"]);
+        let before = c.windows[0].samples.len();
+        assert!(c.scale(0, "fable").is_some());
+        c.observe(buckets(35.0, 10_000_000), 2_000_000, true);
+        assert!(
+            c.scale(0, "fable").is_none(),
+            "an unexplained rise must invalidate current readiness"
+        );
+        assert_eq!(
+            c.windows[0].samples.len(),
+            before,
+            "reject the empty interval without inventing a row or erasing valid ledger pairs"
+        );
+        c.record(&record(2_001_000, "fable", 100, 0));
+        c.observe(buckets(36.0, 10_000_000), 2_002_000, true);
+        assert_eq!(c.windows[0].samples.len(), before + 1);
+        let scale = c
+            .scale(0, "fable")
+            .expect("the next exact interval can refit valid evidence");
+        assert!((scale.tokens_per_percent - 100.0).abs() < 2.0);
+        assert!((scale.output_weight - 4.0).abs() < 0.1);
+    }
+
+    #[test]
     fn forecast_profile_is_monday_first_normalized_shrunk_and_banded() {
         let start = OffsetDateTime::parse(
             "2026-09-28T00:00:00Z",
