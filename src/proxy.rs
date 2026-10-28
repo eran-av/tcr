@@ -26367,7 +26367,7 @@ mod forecast_routing_tests {
                 25,
             ),
         );
-        for _ in 0..=24 {
+        for step in 0_u64..=24 {
             // Keep consecutive readings and completions on distinct milliseconds.
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
             post(
@@ -26376,6 +26376,20 @@ mod forecast_routing_tests {
                 r#"{"model":"claude-fable-5","messages":[],"max_tokens":32}"#,
             )
             .await;
+            // The response can arrive before its spawned usage task finishes.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+                    if snapshot.accounts[0].input_tokens == 100 + (step / 2 + 1) * 100
+                        && snapshot.accounts[0].output_tokens == 25 + step.div_ceil(2) * 25
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("previous training response usage must be recorded before the next request");
         }
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
