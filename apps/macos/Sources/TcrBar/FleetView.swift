@@ -5928,9 +5928,6 @@ struct AccountRow: View {
         let redeem = alert.addButton(withTitle: "Redeem")
         redeem.hasDestructiveAction = true
         alert.addButton(withTitle: "Cancel")
-        alert.window.defaultButtonCell = nil
-        alert.buttons.last?.keyEquivalent = "\r"
-        redeem.keyEquivalent = ""
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         performReset(retrying: false)
     }
@@ -5948,11 +5945,9 @@ struct AccountRow: View {
             alert.messageText = "Redeem reset"
             alert.informativeText = outcome.text
             if outcome.exitCode != 0 {
-                alert.addButton(withTitle: "Retry").keyEquivalent = ""
+                alert.addButton(withTitle: "Retry")
             }
             alert.addButton(withTitle: "Cancel")
-            alert.window.defaultButtonCell = nil
-            alert.buttons.last?.keyEquivalent = "\r"
             let response = alert.runModal()
             if outcome.exitCode != 0, response == .alertFirstButtonReturn {
                 performReset(retrying: true)
